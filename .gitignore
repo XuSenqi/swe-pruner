@@ -21,3 +21,4 @@
 **/logs
 **/runs
 **/swe-pruner.yaml
+**/*.log

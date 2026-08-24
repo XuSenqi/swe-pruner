@@ -23,6 +23,14 @@ import httpx
 # 全局 HTTP hack 设置（在导入 OpenHands SDK 之前执行）
 def setup_http_hack_for_claude():
     """设置 HTTP 请求层拦截，修复 Claude API 的参数冲突"""
+    load_dotenv()
+    model_name = os.getenv("OPENHANDS_MODEL_NAME", "")
+    if "claude" not in model_name.lower():
+        print(
+            "[HTTP HACK] skipped: OPENHANDS_MODEL_NAME is not Claude; "
+            "leaving httpx unmodified"
+        )
+        return False
     try:
         # 保存原始的 httpx 请求方法（同步和异步）
         if not hasattr(httpx.Client, "_original_request"):
@@ -393,6 +401,8 @@ def setup_http_hack_for_claude():
                 def patched_send_sync(self, request, **kwargs):
                     """拦截 send 方法，修复请求体"""
                     url_str = str(request.url)
+                    if "anthropic.com" not in url_str.lower():
+                        return httpx.Client._original_send(self, request, **kwargs)
                     if "anthropic.com" in url_str.lower():
                         # 尝试修改请求体
                         if hasattr(request, "content") and request.content:
