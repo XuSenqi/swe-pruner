@@ -16,28 +16,49 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 import typer
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from dotenv import load_dotenv
 app = typer.Typer(help="LLM-as-a-Judge: 使用 LLM 对问答答案进行评分")
 
 load_dotenv()
-def get_eval_client() -> AzureOpenAI:
-    print(os.getenv("EVAL_LLM_BASE_URL"))
-    print(os.getenv("EVAL_LLM_API_VERSION"))
-    print(os.getenv("EVAL_LLM_API_KEY"))
-    return AzureOpenAI(
-        azure_endpoint=os.getenv("EVAL_LLM_BASE_URL"),
-        api_version=os.getenv("EVAL_LLM_API_VERSION"),
-        api_key=os.getenv("EVAL_LLM_API_KEY"),
-        default_headers={"X-TT-LOGID": "${your_logid}"},
-    )
+
+
+def _eval_model_name(model: Optional[str]) -> str:
+    """LiteLLM-style prefixes are not valid deployment/model ids for the OpenAI SDK."""
+    name = model or os.getenv("EVAL_LLM_MODEL_NAME") or ""
+    for prefix in ("openai/", "azure/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
+def get_eval_client():
+    """Build the judge client.
+
+    `API_TYPE=openai` (or an empty Azure api-version) uses a standard OpenAI-compatible
+    `/v1/chat/completions` endpoint. AzureOpenAI would request
+    `/openai/deployments/...` and 404 on gateways like modelverse.
+    """
+    api_type = (os.getenv("API_TYPE") or "openai").strip().lower()
+    base_url = os.getenv("EVAL_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    api_key = os.getenv("EVAL_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_version = os.getenv("EVAL_LLM_API_VERSION") or ""
+    print(f"[judge] api_type={api_type} base_url={base_url} model={_eval_model_name(None)}")
+    if api_type == "azure" and api_version:
+        return AzureOpenAI(
+            azure_endpoint=base_url,
+            api_version=api_version,
+            api_key=api_key,
+            default_headers={"X-TT-LOGID": "${your_logid}"},
+        )
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def score_answer(
     question: str,
     reference: str,
     candidate: str,
-    eval_client: AzureOpenAI,
+    eval_client,
     model: str
 ) -> Optional[Dict[str, int]]:
     """
@@ -112,26 +133,25 @@ REQUIREMENT:
 
     try:
         # Use GPT-5 Responses API for evaluation
-        response = eval_client.chat.completions.create(
-            model=model,
-            messages=[
+        create_kwargs = {
+            "model": _eval_model_name(model),
+            "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ]
+                    "content": prompt,
                 }
             ],
-            extra_body={
+        }
+        # Original Azure GPT-5 setup used extra thinking; OpenAI-compatible
+        # gateways (e.g. modelverse) 404/400 if this is always sent.
+        if isinstance(eval_client, AzureOpenAI):
+            create_kwargs["extra_body"] = {
                 "thinking": {
                     "include_thoughts": False,
-                    "budget_tokens": 1024
+                    "budget_tokens": 1024,
                 }
-            },
-        )
+            }
+        response = eval_client.chat.completions.create(**create_kwargs)
         
         # Extract response text from Responses API format
         score_str = response.choices[0].message.content.strip()
@@ -167,7 +187,7 @@ REQUIREMENT:
 def process_single_record(
     candidate_record: Dict[str, Any],
     reference_dict: Dict[str, str],
-    eval_client: AzureOpenAI,
+    eval_client,
     model: str
 ) -> Optional[Dict[str, Any]]:
     """
@@ -228,7 +248,7 @@ def evaluate_jsonl_parallel(
     candidate_jsonl_path: str,
     reference_jsonl_path: str,
     output_jsonl_path: str,
-    eval_client: AzureOpenAI,
+    eval_client,
     model: str,
     max_workers: int = 16
 ) -> None:
@@ -316,7 +336,7 @@ def evaluate(
     评估单个候选答案文件
     """
     eval_client = get_eval_client()
-    eval_model = model or os.getenv("EVAL_LLM_MODEL_NAME")
+    eval_model = _eval_model_name(model)
     
     if not os.path.exists(candidate_path):
         typer.echo(f"错误: 候选答案文件不存在: {candidate_path}", err=True)
@@ -352,7 +372,7 @@ def batch(
     python llm-as-judge.py batch -c "answer/full-glm/reflex.jsonl,answer/full-glm/streamlink.jsonl" -r answer/reference/reflex.jsonl -e pruner
     """
     eval_client = get_eval_client()
-    eval_model = model or os.getenv("EVAL_LLM_MODEL_NAME")
+    eval_model = _eval_model_name(model)
     
     # 验证实验类型
     if experiment not in ["pruner", "baseline"]:

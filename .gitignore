@@ -17,3 +17,8 @@
 
 **/answer-*
 **/traj-*
+
+**/logs
+**/runs
+**/swe-pruner.yaml
+**/*.log
