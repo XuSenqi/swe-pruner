@@ -17,6 +17,18 @@ pruner_url = os.getenv("PRUNER_URL", "http://localhost:8000/prune")
 prune_threshold = float(os.getenv("PRUNE_THRESHOLD", 0.4))
 
 
+def _workspace_cwd(conv_state) -> Optional[str]:
+    """Resolve the OpenHands workspace directory from conversation state."""
+    ws = getattr(conv_state, "workspace", None)
+    working_dir = getattr(ws, "working_dir", None) if ws is not None else None
+    if not working_dir:
+        return None
+    path = Path(working_dir)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return str(path.resolve())
+
+
 class PruneRequest(BaseModel):
     query: str
     code: str
@@ -90,11 +102,11 @@ def prune_fn(context: str, query: str) -> PruneResponse:
         raise
 
 
-def _execute_bash_command(command: str) -> str:
+def _execute_bash_command(command: str, cwd: Optional[str] = None) -> str:
     """Execute a bash command and return output as list of lines."""
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=10
+            command, shell=True, capture_output=True, text=True, timeout=10, cwd=cwd
         )
         output = result.stdout.strip() if result.stdout.strip() else "(No output)"
         return output
@@ -157,16 +169,20 @@ class BashObservation(Observation):
 class OriginBashExecutor(ToolExecutor[OriginBashAction, BashObservation]):
     """Executor for original bash commands without pruning."""
 
+    cwd: Optional[str] = None
+
     def __call__(self, action: OriginBashAction, conversation=None) -> BashObservation:  # noqa: ARG002
-        output = _execute_bash_command(action.command)
+        output = _execute_bash_command(action.command, cwd=self.cwd)
         return BashObservation(output=output, pruned=False, original_output=output)
 
 
 class PrunerBashExecutor(ToolExecutor[PrunerBashAction, BashObservation]):
     """Executor for bash commands with context-aware pruning."""
 
+    cwd: Optional[str] = None
+
     def __call__(self, action: PrunerBashAction, conversation=None) -> BashObservation:  # noqa: ARG002
-        original_output = _execute_bash_command(action.command)
+        original_output = _execute_bash_command(action.command, cwd=self.cwd)
 
         if action.context_focus_question:
             try:
@@ -231,9 +247,9 @@ Use `context_focus_question` to filter large command outputs for relevant inform
 - lines 50-100 of data_loader.py (contains file info)
 - fix bug in rwkv6.py (too vague)
 
-**IMPORTANT:** With pruner enabled, prefer `cat -n` or `nl -ba` with context_focus_question to see line numbers. Then you can use `sed` without filtering for more detailed context since you have line number information.
+**IMPORTANT:** With pruner enabled, when the command may return a lot of text (`cat`, `grep`, `find`, a large `sed` range), set `context_focus_question` to a complete question about what you need from that output.
 
-**IMPORTANT:** If the command output is small and important like `ls`, just leave context_focus_question blank.
+**IMPORTANT:** Leave `context_focus_question` blank only for tiny outputs (`pwd`, `ls` of one directory, `wc`).
 """
 )
 
@@ -258,6 +274,7 @@ class OriginBashTool(ToolDefinition[OriginBashAction, BashObservation]):
         """
         if executor is None:
             executor = OriginBashExecutor()
+        executor.cwd = _workspace_cwd(conv_state)
 
         return [
             cls(
@@ -289,6 +306,7 @@ class PrunerBashTool(ToolDefinition[PrunerBashAction, BashObservation]):
         """
         if executor is None:
             executor = PrunerBashExecutor()
+        executor.cwd = _workspace_cwd(conv_state)
 
         return [
             cls(

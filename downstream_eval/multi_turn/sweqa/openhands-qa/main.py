@@ -601,6 +601,15 @@ else:
     raise NotImplementedError
 
 
+def _openai_sdk_model_name(name: str | None) -> str:
+    """LiteLLM prefixes are not valid model ids for the raw OpenAI SDK."""
+    name = name or ""
+    for prefix in ("openai/", "azure/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
 # Load base paths from environment
 BASE_REPO_PATH = os.getenv("BASE_REPO_PATH", "./swe-repos")
 QUESTIONS_PATH = os.getenv("QUESTIONS_PATH", "./questions")
@@ -1353,15 +1362,20 @@ Based on the conversation history above, please provide a comprehensive answer t
             {"role": "user", "content": user_prompt},
         ]
 
-        print(f"[DEBUG] 调用 LLM 生成答案，对话历史长度: {len(full_conversation)} 字符")
+        sdk_model = _openai_sdk_model_name(llm_config.get("model"))
+        print(
+            f"[DEBUG] 调用 LLM 生成答案，model={sdk_model}，对话历史长度: {len(full_conversation)} 字符"
+        )
 
-        response = client.chat.completions.create(
-            model=llm_config["model"],
-            messages=formatted_messages,
-            temperature=0.3,
-            extra_headers={"X-TT-LOGID": "${your_logid}"},
-            stream=False,
-        )  # stream=False for gemini3 bug
+        create_kwargs = {
+            "model": sdk_model,
+            "messages": formatted_messages,
+            "temperature": 0.3,
+            "stream": False,  # stream=False for gemini3 bug
+        }
+        if api_type == "azure":
+            create_kwargs["extra_headers"] = {"X-TT-LOGID": "${your_logid}"}
+        response = client.chat.completions.create(**create_kwargs)
 
         answer = response.choices[0].message.content.strip()
 
@@ -1604,34 +1618,25 @@ Then answer: {question}"""
         print(f"[DEBUG] 获取到 {len(message_history)} 条消息历史")
 
         # 获取 token 使用量（分别统计 input 和 output）
+        # accumulated_token_usage 已是各轮之和；不要再加 token_usages，否则会记两遍。
         if hasattr(state, "stats") and state.stats:
             stats = state.stats
-            if hasattr(stats, "usage_to_metrics"):
-                total_prompt_tokens = 0
-                total_completion_tokens = 0
-                for usage_id, metrics in stats.usage_to_metrics.items():
-                    if (
-                        hasattr(metrics, "accumulated_token_usage")
-                        and metrics.accumulated_token_usage
-                    ):
-                        token_usage = metrics.accumulated_token_usage
-                        if hasattr(token_usage, "prompt_tokens") and hasattr(
-                            token_usage, "completion_tokens"
-                        ):
-                            total_prompt_tokens += token_usage.prompt_tokens
-                            total_completion_tokens += token_usage.completion_tokens
-                    if hasattr(metrics, "token_usages") and metrics.token_usages:
-                        for token_usage in metrics.token_usages:
-                            if hasattr(token_usage, "prompt_tokens") and hasattr(
-                                token_usage, "completion_tokens"
-                            ):
-                                total_prompt_tokens += token_usage.prompt_tokens
-                                total_completion_tokens += token_usage.completion_tokens
-                answer_data["prompt_tokens"] = total_prompt_tokens
-                answer_data["completion_tokens"] = total_completion_tokens
-                answer_data["token_cost"] = (
-                    total_prompt_tokens + total_completion_tokens
-                )  # 总 token 数（向后兼容）
+            prompt = 0
+            completion = 0
+            if hasattr(stats, "get_combined_metrics"):
+                usage = stats.get_combined_metrics().accumulated_token_usage
+                if usage is not None:
+                    prompt = usage.prompt_tokens or 0
+                    completion = usage.completion_tokens or 0
+            elif hasattr(stats, "usage_to_metrics") and stats.usage_to_metrics:
+                for metrics in stats.usage_to_metrics.values():
+                    usage = getattr(metrics, "accumulated_token_usage", None)
+                    if usage is not None:
+                        prompt += getattr(usage, "prompt_tokens", 0) or 0
+                        completion += getattr(usage, "completion_tokens", 0) or 0
+            answer_data["prompt_tokens"] = prompt
+            answer_data["completion_tokens"] = completion
+            answer_data["token_cost"] = prompt + completion
 
         # 如果还没有获取到答案，从 events 中查找
         if not answer_data["answer"]:
