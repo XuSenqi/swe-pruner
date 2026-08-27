@@ -6,7 +6,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import fire
 from vllm import LLM, SamplingParams
-from vllm.sampling_params import GuidedDecodingParams
+from vllm.sampling_params import StructuredOutputsParams
 from loguru import logger
 import gc
 from typing import Optional
@@ -54,9 +54,14 @@ except ImportError:
 # Add parent directory to path to import model and RAG functions
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import RAG functions from LCC/main.py
-from model import SilverLabelPrunerModel, OnlineRerankPrunerModel
 from embedder import BertBasedEmbedder, QwenEmbedder, BGEM3Embedder, EmbedderAdapter
+
+
+def _load_pruner_models():
+    """Lazy import: model.py pulls langchain_openai, not needed for full/rag/no_context."""
+    from model import OnlineRerankPrunerModel, SilverLabelPrunerModel
+
+    return OnlineRerankPrunerModel, SilverLabelPrunerModel
 from reranker import (
     BertBasedReranker,
     BGEV2M3Reranker,
@@ -504,9 +509,9 @@ def generate_completions(
     if use_guided_decoding:
         # Use guided decoding for structured JSON output
         json_schema = LongCodeQAAnswer.model_json_schema()
-        guided_decoding_params = GuidedDecodingParams(json=json_schema)
+        structured_outputs_params = StructuredOutputsParams(json=json_schema)
         sampling_params = SamplingParams(
-            guided_decoding=guided_decoding_params,
+            structured_outputs=structured_outputs_params,
             temperature=0,
             top_p=0.95,
             max_tokens=max_new_tokens,
@@ -718,6 +723,7 @@ def evaluate_longcodeqa(
     tensor_parallel_size: int = 1,
     trust_remote_code: bool = True,
     gpu_memory_utilization: float = 0.9,
+    enforce_eager: bool = False,
     # Pruner params for rag_with_pruner and function_rag_with_pruner
     pruner_type: str = "silver_label",  # "silver_label" or "online_rerank"
     pruner_model_name: str = None,
@@ -1217,6 +1223,8 @@ def evaluate_longcodeqa(
                     f"{method} method requires silver_label pruner type, but got {effective_pruner_type}. Forcing to silver_label."
                 )
             effective_pruner_type = "silver_label"
+
+        OnlineRerankPrunerModel, SilverLabelPrunerModel = _load_pruner_models()
 
         if effective_pruner_type == "online_rerank":
             pruner = OnlineRerankPrunerModel(
@@ -1823,7 +1831,12 @@ def evaluate_longcodeqa(
                     )
             else:
                 # Use original prompt structure but add JSON instruction
-                if prompt_goal:
+                if method == "no_context":
+                    if prompt_goal:
+                        final_prompt = f"{prompt_goal}\n{question}{json_instruction}"
+                    else:
+                        final_prompt = f"{question or prompt_text}{json_instruction}"
+                elif prompt_goal:
                     final_prompt = f"{prompt_goal}\nRepository: {repo_text}\n{question}{json_instruction}"
                 else:
                     final_prompt = f"{prompt_text}{json_instruction}"
@@ -1892,6 +1905,7 @@ def evaluate_longcodeqa(
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
+            enforce_eager=enforce_eager,
         )
         logger.info(f"Generation LLM {model_name} initialized.")
     except Exception as e:

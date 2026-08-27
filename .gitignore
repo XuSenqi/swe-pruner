@@ -22,3 +22,9 @@
 **/runs
 **/swe-pruner.yaml
 **/*.log
+
+downstream_eval/single_turn/data/
+downstream_eval/single_turn/models/
+downstream_eval/single_turn/results/
+downstream_eval/single_turn/longcodeqa_32k.jsonl
+downstream_eval/single_turn/sync.sh

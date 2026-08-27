@@ -1,6 +1,4 @@
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from typing import Protocol, List
+from typing import Any, List, Protocol
 import re
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
@@ -73,7 +71,7 @@ class SilverLabelPrunerModel(PrunerModel):
 
     def __init__(
         self,
-        model: ChatOpenAI = None,
+        model: Any = None,
         vllm_model_name: str = None,
         temperature: float = 0.3,
         max_tokens: int = 8192,
@@ -122,6 +120,8 @@ class SilverLabelPrunerModel(PrunerModel):
 
             # Create ChatOpenAI instance for online mode if not provided
             if not self.model:
+                from langchain_openai import ChatOpenAI
+
                 self.model = ChatOpenAI(
                     model_name=model_name,
                     temperature=temperature,
@@ -222,6 +222,8 @@ class SilverLabelPrunerModel(PrunerModel):
             raise ValueError("ChatOpenAI model not initialized for single inference")
 
         formatted_code = code_formatter(origin_code, splitter="line")
+
+        from langchain_core.prompts import ChatPromptTemplate
 
         p = ChatPromptTemplate.from_template(self.prompt_template)
         chain = p | self.model
