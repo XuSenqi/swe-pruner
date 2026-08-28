@@ -726,6 +726,7 @@ def evaluate_completion(
         num_examples=num_examples,
         filter_current_lines_max=filter_current_lines_max,
         filter_background_tokens_min=filter_background_tokens_min,
+        tokenizer_name=model_name,
     )
     logger.info(
         f"Loaded {len(dataset)} examples from {dataset_path} ({dataset_split} split)"

@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 import re
 from tqdm import tqdm
-from modelscope.msdatasets import MsDataset
 from pathlib import Path
 
 _FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n([\s\S]*?)```", re.MULTILINE)
@@ -81,6 +80,7 @@ def load_data(
     num_examples=500,
     filter_current_lines_max=50,
     filter_background_tokens_min=5000,
+    tokenizer_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
 ):
     """
     Loads the dataset, processes it to split contexts, filters it based on context lengths,
@@ -96,8 +96,8 @@ def load_data(
     original_size = len(dataset)  # Size before filtering
 
     # Initialize tokenizer here for filtering and potential later use
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
-    print("Tokenizer Qwen/Qwen2.5-Coder-7B-Instruct initialized.")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+    print(f"Tokenizer {tokenizer_name} initialized.")
 
     # Process dataset to add split contexts first
     print("Splitting context into background and current function...")
