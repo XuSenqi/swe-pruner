@@ -251,13 +251,29 @@ agent:
     Note: A common trigger for this error is you put > 1 bash block(action) in your response.
   step_limit: 100
   cost_limit: 3.
+  max_repeat_steps: 10
   pruner:
     url: http://localhost:8047/prune
     timeout: 120
     retries: 3
-    min_chars: 500
+    min_output_chars: 1600
+    min_keep_ratio: 0.35
+    skip_prune_on_reread: true
     chunk_overlap_tokens: 50
     threshold: 0.4
+  cfq_generator:
+    url: http://10.10.10.181:8000/v1/chat/completions
+    model: Qwen3.5-35B-A3B-FP8
+    timeout: 60
+    retries: 2
+    max_tokens: 256
+    temperature: 0.0
+    refine_existing: false
+    min_output_chars: 3200
+    min_reasoning_chars: 150
+    max_prior_reasoning_steps: 4
+    chat_template_kwargs:
+      enable_thinking: false
 
 environment:
   cwd: "/testbed"

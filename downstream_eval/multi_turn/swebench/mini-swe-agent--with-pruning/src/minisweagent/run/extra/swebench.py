@@ -406,6 +406,18 @@ def main(
         help="Disable output pruning for this run",
         rich_help_panel="Pruner",
     ),
+    cfq_generator_url: str | None = typer.Option(
+        None,
+        "--cfq-generator-url",
+        help="Override CFQ generator endpoint (OpenAI-compatible chat completions URL)",
+        rich_help_panel="Pruner",
+    ),
+    disable_cfq_generator: bool = typer.Option(
+        False,
+        "--disable-cfq-generator",
+        help="Disable automatic CFQ generation from the small model",
+        rich_help_panel="Pruner",
+    ),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -446,6 +458,7 @@ def main(
     agent_cfg = config.setdefault("agent", {})
     if disable_pruner:
         agent_cfg.pop("pruner", None)
+        agent_cfg.pop("cfq_generator", None)
         # Use hardcoded original templates without context_focus_question content
         # This ensures baseline results remain consistent even if the prompt is modified
         agent_cfg["system_template"] = _ORIGINAL_SYSTEM_TEMPLATE
@@ -455,6 +468,12 @@ def main(
         pruner_cfg = agent_cfg.setdefault("pruner", {})
         if pruner_url:
             pruner_cfg["url"] = pruner_url
+        if disable_cfq_generator:
+            agent_cfg.pop("cfq_generator", None)
+        else:
+            cfq_cfg = agent_cfg.setdefault("cfq_generator", {})
+            if cfq_generator_url:
+                cfq_cfg["url"] = cfq_generator_url
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
