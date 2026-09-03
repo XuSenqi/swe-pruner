@@ -10,7 +10,14 @@ from jinja2 import StrictUndefined, Template
 from minisweagent import Environment, Model
 
 from typing import Any
+
+from minisweagent.utils.cfq_generator import CFQGenerator, CFQGeneratorConfig
 from minisweagent.utils.pruner import PrunerClient, PrunerConfig, PruneResponse, PrunerRequest
+
+_READ_COMMAND_HINTS = ("cat ", "nl ", "grep ", "sed -n", "head ", "tail ")
+_FILE_PATH_PATTERN = re.compile(r"(?:/testbed/)?[\w./-]+\.py")
+
+
 def _resolve_env_placeholders(value: Any):
     if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
         key = value[2:-1]
@@ -22,6 +29,42 @@ def _resolve_env_placeholders(value: Any):
     return value
 
 from minisweagent.utils.log import logger
+
+
+def _is_read_command(command: str) -> bool:
+    cmd = command.strip().split("&&")[0].strip()
+    if cmd.startswith("sed -i") or cmd.startswith("python") or "pytest" in cmd:
+        return False
+    return any(hint in cmd for hint in _READ_COMMAND_HINTS)
+
+
+def _extract_read_paths(command: str) -> list[str]:
+    if not _is_read_command(command):
+        return []
+    paths = _FILE_PATH_PATTERN.findall(command)
+    return list(dict.fromkeys(path.removeprefix("/testbed/") for path in paths))
+
+
+def _prune_fallback_reason(
+    result: PruneResponse,
+    config: PrunerConfig,
+    *,
+    min_output_chars: int | None = None,
+) -> str | None:
+    if result.origin_token_cnt <= 0:
+        return None
+    threshold_chars = min_output_chars if min_output_chars is not None else config.min_output_chars
+    min_origin_tokens = max(threshold_chars // 4, 1)
+    if result.origin_token_cnt < min_origin_tokens:
+        return "small_output"
+    if result.score < config.threshold:
+        return "low_score"
+    if config.min_keep_ratio > 0:
+        keep_ratio = result.left_token_cnt / result.origin_token_cnt
+        if keep_ratio < config.min_keep_ratio:
+            return "low_keep_ratio"
+    return None
+
 
 @dataclass
 class AgentConfig:
@@ -42,6 +85,8 @@ class AgentConfig:
     step_limit: int = 0
     cost_limit: float = 3.0
     pruner: dict[str, Any] | None = None
+    cfq_generator: dict[str, Any] | None = None
+    max_repeat_steps: int = 0
 
 
 class NonTerminatingException(Exception):
@@ -68,6 +113,10 @@ class LimitsExceeded(TerminatingException):
     """Raised when the agent has reached its cost or step limit."""
 
 
+class RepeatedAction(TerminatingException):
+    """Raised when the LM repeats the same action too many times (dead loop)."""
+
+
 class DefaultAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig, **kwargs):
         self.config = config_class(**kwargs)
@@ -81,6 +130,14 @@ class DefaultAgent:
             pruner_cfg = PrunerConfig(**{k: v for k, v in _resolve_env_placeholders(self.config.pruner).items()})
             print(f"Loaded Pruner Config: {pruner_cfg}")
             self.pruner_client = PrunerClient(pruner_cfg)
+        self.cfq_generator: CFQGenerator | None = None
+        if self.config.cfq_generator:
+            cfq_cfg = CFQGeneratorConfig(**{k: v for k, v in _resolve_env_placeholders(self.config.cfq_generator).items()})
+            print(f"Loaded CFQ Generator Config: {cfq_cfg}")
+            self.cfq_generator = CFQGenerator(cfq_cfg)
+        self._file_read_counts: dict[str, int] = {}
+        self._last_action: str | None = None
+        self._repeat_count: int = 0
 
     def render_template(self, template: str, **kwargs) -> str:
         template_vars = asdict(self.config) | self.env.get_template_vars() | self.model.get_template_vars()
@@ -95,6 +152,9 @@ class DefaultAgent:
         """Run step() until agent is finished. Return exit status & message"""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        self._file_read_counts = {}
+        self._last_action = None
+        self._repeat_count = 0
         self.add_message("system", self.render_template(self.config.system_template))
         self.add_message("user", self.render_template(self.config.instance_template))
         unparsed_err_cnt = 0
@@ -149,6 +209,8 @@ class DefaultAgent:
         message_kwargs: dict[str, Any] = {}
         if output.get("pruned_stats"):
             message_kwargs["pruned_stats"] = output["pruned_stats"]
+        if output.get("cfq_stats"):
+            message_kwargs["cfq_stats"] = output["cfq_stats"]
         self.add_message("user", observation, **message_kwargs)
         return output
 
@@ -182,7 +244,19 @@ class DefaultAgent:
         
         return {"action": action_text, "context_focus_question": context_focus_question, **response}
 
+    def _track_repeat(self, action: str) -> None:
+        if self.config.max_repeat_steps <= 0:
+            return
+        if action == self._last_action:
+            self._repeat_count += 1
+            if self._repeat_count > self.config.max_repeat_steps:
+                raise RepeatedAction(f"Repeated the same action {self._repeat_count} times: {action}")
+        else:
+            self._last_action = action
+            self._repeat_count = 1
+
     def execute_action(self, action: dict) -> dict:
+        self._track_repeat(action["action"])
         try:
             output = self.env.execute(action["action"])
         except subprocess.TimeoutExpired as e:
@@ -196,11 +270,50 @@ class DefaultAgent:
         self._apply_pruner(action, output)
         return output
 
+    def _extract_reasoning_content(self, message: dict) -> str:
+        try:
+            msg = message["extra"]["response"]["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        reasoning = msg.get("reasoning_content") or ""
+        if not reasoning:
+            reasoning = (msg.get("provider_specific_fields") or {}).get("reasoning_content") or ""
+        return reasoning.strip()
+
+    def _collect_prior_reasoning(self) -> list[str]:
+        max_steps = self.cfq_generator.config.max_prior_reasoning_steps if self.cfq_generator else 4
+        prior_messages = [msg for msg in self.messages if msg["role"] == "assistant"][:-1]
+        reasonings: list[str] = []
+        for msg in reversed(prior_messages):
+            reasoning = self._extract_reasoning_content(msg)
+            if reasoning:
+                reasonings.append(reasoning)
+            if len(reasonings) >= max_steps:
+                break
+        reasonings.reverse()
+        return reasonings
+
     def has_finished(self, output: dict[str, str]):
         """Raises Submitted exception with final output if the agent has finished its task."""
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
         if lines and lines[0].strip() in ["MINI_SWE_AGENT_FINAL_OUTPUT", "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"]:
             raise Submitted("".join(lines[1:]))
+
+    def _get_prune_skip_reason(self, command: str, text: str, *, min_output_chars: int) -> str | None:
+        if not self.pruner_client:
+            return None
+        config = self.pruner_client.config
+        if min_output_chars > 0 and len(text) < min_output_chars:
+            return "small_output"
+        if config.skip_prune_on_reread:
+            for path in _extract_read_paths(command):
+                if self._file_read_counts.get(path, 0) >= 1:
+                    return "reread"
+        return None
+
+    def _record_file_reads(self, command: str) -> None:
+        for path in _extract_read_paths(command):
+            self._file_read_counts[path] = self._file_read_counts.get(path, 0) + 1
 
     def _apply_pruner(self, action: dict, output: dict[str, str]) -> None:
         if not self.pruner_client:
@@ -209,12 +322,72 @@ class DefaultAgent:
         if not text:
             return
         
-        # Priority 1: Use context_focus_question from action if provided
         context_focus_question = action.get("context_focus_question")
+        cfq_source = "agent" if context_focus_question else None
+        agent_min_output_chars = self.pruner_client.config.min_output_chars
+        auto_cfq_min_output_chars = (
+            self.cfq_generator.config.min_output_chars if self.cfq_generator else agent_min_output_chars
+        )
+        min_output_chars = agent_min_output_chars if context_focus_question else auto_cfq_min_output_chars
+
+        skip_reason = self._get_prune_skip_reason(
+            action["action"], text, min_output_chars=min_output_chars
+        )
+        if skip_reason in ("small_output", "reread"):
+            output["output"] = text
+            if context_focus_question:
+                output["cfq_stats"] = {
+                    "source": cfq_source,
+                    "context_focus_question": context_focus_question,
+                    "used_prior_context": False,
+                    "prune_skipped": skip_reason,
+                }
+            logger.debug(
+                "Skipping CFQ/prune (%s) for command: %s",
+                skip_reason,
+                action["action"][:120],
+            )
+            self._record_file_reads(action["action"])
+            return
+
+        reasoning_content = self._extract_reasoning_content(action)
+        prior_reasoning = self._collect_prior_reasoning() if self.cfq_generator else []
+        used_prior_context = False
+        if (
+            not context_focus_question
+            and self.cfq_generator
+            and (reasoning_content or prior_reasoning)
+            and self.cfq_generator.should_generate(
+                action["action"], text, min_output_chars=auto_cfq_min_output_chars
+            )
+        ):
+            _, used_prior_context = self.cfq_generator.build_reasoning_block(
+                reasoning_content,
+                prior_reasoning,
+                min_chars=self.cfq_generator.config.min_reasoning_chars,
+            )
+            context_focus_question = self.cfq_generator.generate(
+                reasoning=reasoning_content,
+                command=action["action"],
+                prior_reasoning=prior_reasoning,
+                existing_cfq=context_focus_question,
+            )
+            if context_focus_question:
+                cfq_source = "cfq_generator"
+
+        if context_focus_question:
+            output["cfq_stats"] = {
+                "source": cfq_source,
+                "context_focus_question": context_focus_question,
+                "used_prior_context": used_prior_context,
+            }
+            logger.debug("Using CFQ (%s): %s", cfq_source, context_focus_question)
+
         if not context_focus_question:
             output["output"] = text
+            self._record_file_reads(action["action"])
             return
-        # Call pruner with context_focus_question
+
         req = PrunerRequest(
             code=text,
             query=context_focus_question,
@@ -223,18 +396,38 @@ class DefaultAgent:
             chunk_overlap_tokens=self.pruner_client.config.chunk_overlap_tokens,
         )
         pruned_result: PruneResponse = self.pruner_client.prune(req)
-        if pruned_result.error_msg:
-            output["output"] = f"[Pruner Error]: {pruned_result.error_msg}\n\nOriginal Output:\n{text}"
-        else:
-            if pruned_result.left_token_cnt == pruned_result.origin_token_cnt:
-                output["output"] = "All outputs are judged as relevent! Output:\n" + text
-            else:
-                output["output"] = "Filtered some unrelevant parts judged by your context_focus_question, good try! Filtered Output:\n" + pruned_result.pruned_code
-        
-        # saves other stats
         output["pruned_stats"] = {
             "score": pruned_result.score,
             "origin_token_cnt": pruned_result.origin_token_cnt,
             "left_token_cnt": pruned_result.left_token_cnt,
             "model_input_token_cnt": pruned_result.model_input_token_cnt,
         }
+        effective_min_output_chars = (
+            agent_min_output_chars if cfq_source == "agent" else auto_cfq_min_output_chars
+        )
+        fallback_reason = _prune_fallback_reason(
+            pruned_result,
+            self.pruner_client.config,
+            min_output_chars=effective_min_output_chars,
+        )
+        if pruned_result.error_msg:
+            output["output"] = f"[Pruner Error]: {pruned_result.error_msg}\n\nOriginal Output:\n{text}"
+        elif fallback_reason:
+            output["output"] = text
+            output["pruned_stats"]["fallback"] = True
+            output["pruned_stats"]["fallback_reason"] = fallback_reason
+            logger.debug(
+                "Prune fallback (%s): score=%.3f origin=%s left=%s",
+                fallback_reason,
+                pruned_result.score,
+                pruned_result.origin_token_cnt,
+                pruned_result.left_token_cnt,
+            )
+        elif pruned_result.left_token_cnt == pruned_result.origin_token_cnt:
+            output["output"] = "All outputs are judged as relevent! Output:\n" + text
+        else:
+            output["output"] = (
+                "Filtered some unrelevant parts judged by your context_focus_question, good try! Filtered Output:\n"
+                + pruned_result.pruned_code
+            )
+        self._record_file_reads(action["action"])

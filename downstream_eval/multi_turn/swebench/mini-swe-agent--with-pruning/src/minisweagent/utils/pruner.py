@@ -14,7 +14,9 @@ class PrunerConfig(BaseModel):
     threshold: float
     timeout: float = 60.0
     retries: int = 1
-    min_chars: int = 0
+    min_output_chars: int = 1600
+    min_keep_ratio: float = 0.35
+    skip_prune_on_reread: bool = True
     headers: dict[str, str] = Field(default_factory=dict)
     chunk_overlap_tokens: int = 50
 
@@ -49,7 +51,7 @@ class PrunerClient:
         self.session.headers.update(base_headers)
 
     def prune(self, req: PrunerRequest) -> PruneResponse:
-        if not req.query or len(req.code) <= self.config.min_chars:
+        if not req.query or len(req.code) < self.config.min_output_chars:
             # HINT: not pruned, cnt not in statistics
             return PruneResponse(
                 score=0.0,
