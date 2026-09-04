@@ -386,13 +386,147 @@ Auto-CFQ 示例：*What is the structure and key components of the AltAz frame i
 
 两次 score 都高达 0.997/0.998，说明「score 高」不等于「裁得合适」，`min_keep_ratio` 保护是对「裁太狠」的独立兜底。
 
-### 8.5 局限
+### 8.5 加入死循环守卫：v6 全量对比
+
+`runs/with-pruner-GLM-4.6`（baseline）vs `runs/with-pruner-GLM-4.6-CFQ-v6-all`（CFQ dual + `max_repeat_steps: 10` 死循环守卫）。
+
+#### 8.5.1 参数差异
+
+| 参数 | baseline | v6 |
+|------|----------|-----|
+| `cfq_generator` | 无 | `Qwen3.5-35B-A3B-FP8`（`min_output_chars: 3200`） |
+| `pruner.min_output_chars` | `min_chars: 500`（旧键） | `1600` |
+| `pruner.min_keep_ratio` | 无 | `0.35` |
+| `pruner.skip_prune_on_reread` | 无 | `true` |
+| `pruner.threshold` | 0.5 | 0.5 |
+| `max_repeat_steps` | 无 | `10` |
+| `step_limit` / `cost_limit` | 250 / 3.0 | 250 / 3.0 |
+| 主模型 | glm-4.6 | glm-4.6 |
+
+> 注：v6 的 `min_keep_ratio` 为 0.35（本地改到 0.2 的版本未被 `.gitignore` 外的 `swe-pruner.yaml` 实际加载进 v6 运行）。baseline 使用旧代码的 `min_chars: 500` 键。
+
+#### 8.5.2 总体指标
+
+| 指标 | baseline | v6 | 差异 |
+|------|----------|-----|------|
+| 实例数 | 500 | 499 | -1（v6 缺 `sympy__sympy-18199`） |
+| Submitted | 459 (91.8%) | 462 (92.6%) | +3 |
+| 平均步数 | 52.7 | 43.7 | **-17%** |
+| 总 LLM tokens | 717,625,717 | 433,350,985 | **-39.6%** |
+| 平均 tokens/任务 | 1,435,251 | 868,439 | **-39.5%** |
+| prompt_tokens | 711,490,994 | 428,524,263 | -39.8% |
+| completion_tokens | 6,134,723 | 4,826,722 | -21.3% |
+| cached_tokens | 679,493,888 | 403,258,496 | -40.6% |
+| reasoning_tokens | 2,930,171 | 2,148,331 | -26.7% |
+| prune 触发次数 | 14 | 914 | ~65× |
+| prune 成功（无 fallback） | 14 | 185 | — |
+| prune fallback | 0 | 729 | — |
+| auto-CFQ（小模型生成） | 0 | 906 | — |
+
+#### 8.5.3 成功 / 失败实例拆分
+
+| 分组 | baseline | v6 |
+|------|----------|-----|
+| Submitted 实例数 | 459 | 462 |
+| Submitted 总 tokens | 388,913,855 | 347,357,386 |
+| Submitted 平均 tokens/任务 | 847,307 | 751,856（**-11%**） |
+| Submitted 平均调用数 | 41.7 | 40.2 |
+| 失败实例数 | 41 | 37 |
+| 失败总 tokens | 328,711,862 | 85,993,599（**-74%**） |
+| 失败平均 tokens/任务 | 8,017,362 | 2,324,151 |
+| 失败平均调用数 | 176.2 | 87.7 |
+
+#### 8.5.4 退出状态分布
+
+| exit_status | baseline | v6 |
+|-------------|----------|-----|
+| Submitted | 459 | 462 |
+| `LimitsExceeded` | 26 | 4 |
+| `TimeoutExpired` | 11 | 4 |
+| `RepeatedAction`（死循环守卫新增） | — | 29 |
+| `Error` | 4 | 0 |
+
+#### 8.5.5 关键结论
+
+1. **-39.6% 的绝对主力是死循环守卫**：`max_repeat_steps: 10` 把「烧到 250 步 / 超时才停」的失控实例提前判为 `RepeatedAction` 快速失败，失败实例平均 token 从 8.0M 降到 2.3M，贡献了约 240M 的节省。
+2. **pruning 对成功实例的真实净收益是 -11%**（847k → 752k/task），这是 CFQ + pruner 的温和但实在的贡献（约 40M）。
+3. **成功率略升**：459 → 462（91.8% → 92.6%），说明死循环守卫主要杀掉本来就跑不出来的实例，误伤不大。
+
+### 8.6 干净 baseline（无 pruner）vs v6 全量对比
+
+`runs/baseline-GLM-4.6`（**完全不使用 pruner**）vs `runs/with-pruner-GLM-4.6-CFQ-v6-all`（pruner + auto-CFQ + 死循环守卫）。这是最干净的对照：把「无 pruner 的主模型」和「完整 CFQ + pruner + 守卫流水线」直接对比。
+
+#### 8.6.1 配置差异
+
+| 参数 | baseline-GLM-4.6 | v6-all |
+|------|------------------|--------|
+| pruner | 无 | `min_output_chars: 1600` / `min_keep_ratio: 0.35` / `threshold: 0.5` / `skip_prune_on_reread: true` |
+| cfq_generator | 无 | `Qwen3.5-35B-A3B-FP8`（`min_output_chars: 3200`） |
+| `max_repeat_steps` | 无 | `10` |
+| `step_limit` / `cost_limit` | 250 / 3.0 | 250 / 3.0 |
+| 主模型 | glm-4.6 | glm-4.6 |
+
+#### 8.6.2 总体指标（499 个共有实例，v6 缺 `sympy__sympy-18199`）
+
+| 指标 | baseline-GLM-4.6 | v6-all | 差异 |
+|------|------------------|--------|------|
+| 实例数 | 499 | 499 | — |
+| 总步数 | 28,629 | 21,797 | -6,832 |
+| 平均步数 | 57.4 | 43.7 | **-23.9%** |
+| 总 API 调用 | 28,634 | 21,802 | -6,832 |
+| prompt_tokens | 676,578,356 | 428,524,263 | -248,054,093 |
+| completion_tokens | 6,430,616 | 4,826,722 | -1,603,894 |
+| cached_tokens | 644,361,856 | 403,258,496 | -241,103,360 |
+| reasoning_tokens | 2,508,223 | 2,148,331 | -359,892 |
+| **总 LLM tokens** | **683,008,972** | **433,350,985** | **-36.6%** |
+| 平均 tokens/任务 | 1,368,755 | 868,439 | **-36.6%** |
+
+#### 8.6.3 退出状态分布
+
+| exit_status | baseline-GLM-4.6 | v6-all |
+|-------------|------------------|--------|
+| Submitted | 468 | 462 |
+| `LimitsExceeded` | 28 | 4 |
+| `RepeatedAction`（死循环守卫新增） | 0 | 29 |
+| `TimeoutExpired` | 2 | 4 |
+| `Error` | 1 | 0 |
+
+#### 8.6.4 成功 / 失败拆分
+
+| 分组 | 指标 | baseline-GLM-4.6 | v6-all | 变化 |
+|------|------|------------------|--------|------|
+| **Submitted** | 实例数 | 468 | 462 | -6 |
+| | 平均 tokens/任务 | 809,812 | 751,856 | **-7.2%** |
+| | 平均 API 调用 | 46.2 | 40.2 | -6.0 |
+| | 总 tokens | 378,991,833 | 347,357,386 | -8.3% |
+| **失败** | 实例数 | 31 | 37 | +6 |
+| | 平均 tokens/任务 | 9,807,004 | 2,324,151 | **-76.3%** |
+| | 平均 API 调用 | 226.2 | 87.7 | -138.5 |
+| | 总 tokens | 304,017,139 | 85,993,599 | **-71.7%** |
+
+#### 8.6.5 v6 pruner / auto-CFQ 活动
+
+| 指标 | 数值 |
+|------|------|
+| auto-CFQ（小模型生成） | 906 |
+| agent 自带 CFQ | 29 |
+| prune 成功（真正裁短） | 184 |
+| prune fallback | 729 |
+| 裁剪节省（shell 输出 tokens） | 134,541 |
+
+#### 8.6.6 关键结论
+
+1. **-36.6% 的绝对主力是死循环守卫**：baseline 有 28 个实例烧满 250 步（`LimitsExceeded`），v6 用 `max_repeat_steps: 10` 提前判为 `RepeatedAction`（29 个）快速失败，失败侧平均 token 从 9.8M 压到 2.3M（-76%），贡献约 218M 节省。
+2. **pruner + auto-CFQ 对成功实例的真实净收益是 -7.2%**（809k → 752k/task，约 32M），温和但实在——省 token 的同时平均调用数还略降（46.2 → 40.2）。
+3. **成功率基本持平**：468 → 462（93.8% → 92.6%），死循环守卫主要杀掉本来就跑不出来的实例，误伤有限。
+
+### 8.7 局限
 
 - 无 `reasoning_content` 的模型无法生成 CFQ
 - CFQ 小模型、pruner 的 token **不在**主模型 `usage` 统计里
 - `stats.py` 的 `extract_token_stats` 只统计主模型 tokens，不含 shell 输出字符数
 - resolve 率需 SWE-bench 官方评测，不能只看 Submitted
-- GLM-4.6 可能陷入 read-only 死循环，需 agent 层重复命令检测（与 pruner 无关）
+- 死循环守卫（`max_repeat_steps`）只对「完全相同命令」判重，读不同行号的同类命令不会命中，仍可能漏掉部分 read-only 循环
 
 ---
 
