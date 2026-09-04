@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 
 from jinja2 import StrictUndefined, Template
@@ -84,6 +85,8 @@ class AgentConfig:
     action_regex: str = r"```bash\s*\n(.*?)\n```"
     step_limit: int = 0
     cost_limit: float = 3.0
+    time_limit: float = 0.0
+    """Wall-clock time limit in seconds for the whole run. 0 disables it."""
     pruner: dict[str, Any] | None = None
     cfq_generator: dict[str, Any] | None = None
     max_repeat_steps: int = 0
@@ -113,6 +116,10 @@ class LimitsExceeded(TerminatingException):
     """Raised when the agent has reached its cost or step limit."""
 
 
+class TimeLimitExceeded(TerminatingException):
+    """Raised when the agent has run for longer than the configured wall-clock time limit."""
+
+
 class RepeatedAction(TerminatingException):
     """Raised when the LM repeats the same action too many times (dead loop)."""
 
@@ -138,6 +145,7 @@ class DefaultAgent:
         self._file_read_counts: dict[str, int] = {}
         self._last_action: str | None = None
         self._repeat_count: int = 0
+        self._start_time: float = time.monotonic()
 
     def render_template(self, template: str, **kwargs) -> str:
         template_vars = asdict(self.config) | self.env.get_template_vars() | self.model.get_template_vars()
@@ -157,6 +165,7 @@ class DefaultAgent:
         self._repeat_count = 0
         self.add_message("system", self.render_template(self.config.system_template))
         self.add_message("user", self.render_template(self.config.instance_template))
+        self._start_time = time.monotonic()
         unparsed_err_cnt = 0
         while True:
             try:
@@ -180,6 +189,11 @@ class DefaultAgent:
         """Query the model and return the response."""
         if 0 < self.config.step_limit <= self.model.n_calls or 0 < self.config.cost_limit <= self.model.cost:
             raise LimitsExceeded()
+        if 0 < self.config.time_limit and (time.monotonic() - self._start_time) > self.config.time_limit:
+            raise TimeLimitExceeded(
+                f"Exceeded wall-clock time limit of {self.config.time_limit:.0f}s "
+                f"(elapsed {time.monotonic() - self._start_time:.0f}s)"
+            )
         response = self.model.query(self.messages)
         
         # Log raw model response for debugging

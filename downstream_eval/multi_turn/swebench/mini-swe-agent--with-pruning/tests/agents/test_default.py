@@ -53,6 +53,26 @@ def test_cost_limit_enforcement():
     assert exit_status == "LimitsExceeded"
 
 
+def test_time_limit_enforcement():
+    """Test agent stops when wall-clock time limit is reached."""
+    model = DeterministicModel(
+        outputs=[
+            "```bash\necho 'step1'\n```",
+            "```bash\necho 'step2'\n```",
+            "```bash\necho 'step3'\n```",
+        ]
+    )
+
+    agent = DefaultAgent(
+        model=model,
+        env=LocalEnvironment(),
+        time_limit=0.001,  # 1ms, immediately exceeded
+    )
+
+    exit_status, _ = agent.run("Test time limit")
+    assert exit_status == "TimeLimitExceeded"
+
+
 def test_format_error_handling():
     """Test agent handles malformed action formats properly."""
     agent = DefaultAgent(

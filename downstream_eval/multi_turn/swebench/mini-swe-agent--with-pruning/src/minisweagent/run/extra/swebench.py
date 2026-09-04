@@ -418,6 +418,12 @@ def main(
         help="Disable automatic CFQ generation from the small model",
         rich_help_panel="Pruner",
     ),
+    time_limit: float | None = typer.Option(
+        None,
+        "--time-limit",
+        help="Wall-clock time limit per instance in seconds (e.g. 7200 for 2h). 0 disables. Overrides agent.time_limit from the config.",
+        rich_help_panel="Limits",
+    ),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -456,6 +462,8 @@ def main(
         config.setdefault("model", {})["model_class"] = model_class
     
     agent_cfg = config.setdefault("agent", {})
+    if time_limit is not None:
+        agent_cfg["time_limit"] = time_limit
     if disable_pruner:
         agent_cfg.pop("pruner", None)
         agent_cfg.pop("cfq_generator", None)

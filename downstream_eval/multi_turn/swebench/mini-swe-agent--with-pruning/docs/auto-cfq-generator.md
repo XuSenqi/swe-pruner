@@ -86,6 +86,17 @@ len(text)
 
 当前步 `reasoning_content` 过短（< `min_reasoning_chars`，默认 150）时，附加最近 N 步（默认 4 步）的历史 reasoning，避免 CFQ 过于泛化。
 
+### 2.6 单实例墙钟超时（`time_limit`）
+
+防止 agent 在一个 instance 上无限消耗（大量 step 的循环 / 反复探索）。当前默认 **2 小时**。
+
+- **配置**：`agent.time_limit: 7200`（秒；`0` 关闭）
+- **CLI 覆盖**：`--time-limit 7200`
+- **检查时机**：每个 step 的 `query()` 里、请求主模型之前
+- **计时**：`time.monotonic()`，`run()` 开始时归零（不受系统时钟调整影响）
+- **超时行为**：抛 `TimeLimitExceeded`（`TerminatingException`）→ `run()` 捕获 → `exit_status = "TimeLimitExceeded"` → 写入 traj / `preds.json`，该 instance 记为失败
+- **边界**：只防「多步拖垮总时长」；单条命令卡死由 `environment.timeout`（60s）和 Docker `container_timeout: "2h"` 兜底
+
 ---
 
 ## 三、改动文件清单
@@ -98,10 +109,11 @@ len(text)
 | `templates/swe-pruner.yaml` | **修改** | 真实测试配置 |
 | `templates/pruner.yaml` | **修改** | 模板配置 |
 | `src/minisweagent/config/extra/swebench.yaml` | **修改** | 默认 swebench 配置 |
-| `src/minisweagent/run/extra/swebench.py` | **修改** | CLI 参数 |
+| `src/minisweagent/run/extra/swebench.py` | **修改** | CLI 参数（含 `--time-limit`） |
 | `scripts/test_cfq_integration.py` | **新增** | 轨迹回放 + 联调测试 |
 | `tests/utils/test_cfq_generator.py` | **新增** | CFQ 生成器单元测试 |
 | `tests/agents/test_pruner_guards.py` | **新增** | P0 保护 + 双门槛单元测试 |
+| `tests/agents/test_default.py` | **修改** | `TimeLimitExceeded` 超时单元测试 |
 
 ---
 
@@ -174,6 +186,7 @@ len(text)
 
 ```yaml
 agent:
+  time_limit: 7200            # 单实例墙钟超时（秒），2 小时
   pruner:
     url: http://10.10.10.39:6001/prune
     timeout: 120
@@ -215,6 +228,7 @@ model:   # 主模型，与小模型分开配置
 | `min_keep_ratio` | `pruner` | 0.35 | 裁剪后保留比低于此值 → fallback 原文 |
 | `threshold` | `pruner` | 0.5 | pruner score 低于此值 → fallback 原文 |
 | `skip_prune_on_reread` | `pruner` | true | 同一文件重复读取时跳过 CFQ/prune |
+| **`time_limit`** | `agent` | **7200** | 单实例墙钟超时（秒）。超时 → 抛 `TimeLimitExceeded` → 该 instance 判为失败；`0` 关闭 |
 | `min_reasoning_chars` | `cfq_generator` | 150 | 当前 reasoning 过短时附加历史 context |
 | `max_prior_reasoning_steps` | `cfq_generator` | 4 | 最多收集几步历史 reasoning |
 
@@ -235,6 +249,7 @@ model:   # 主模型，与小模型分开配置
 | `--disable-cfq-generator` | 关闭自动 CFQ |
 | `--disable-pruner` | 关闭 pruner（同时关闭 cfq_generator） |
 | `--pruner-url` | 覆盖 pruner endpoint |
+| `--time-limit` | 覆盖单实例墙钟超时（秒，如 `7200`；`0` 关闭） |
 
 ### 5.3 单独重跑一个 instance
 
@@ -277,6 +292,7 @@ uv run python -m pytest tests/utils/test_cfq_generator.py tests/agents/test_prun
 
 - `test_cfq_generator.py`：should_generate、prior reasoning、API 解析、SKIP、默认 `min_output_chars=3200`
 - `test_pruner_guards.py`：small_output 提前跳过、双门槛（agent 2000 字符可 prune / auto-CFQ 2000 不触发）、reread、low_score fallback
+- `test_default.py::test_time_limit_enforcement`：`time_limit` 超时 → `exit_status == "TimeLimitExceeded"`
 
 ### 6.3 完整 SWE-bench
 
@@ -527,6 +543,8 @@ Auto-CFQ 示例：*What is the structure and key components of the AltAz frame i
 - `stats.py` 的 `extract_token_stats` 只统计主模型 tokens，不含 shell 输出字符数
 - resolve 率需 SWE-bench 官方评测，不能只看 Submitted
 - 死循环守卫（`max_repeat_steps`）只对「完全相同命令」判重，读不同行号的同类命令不会命中，仍可能漏掉部分 read-only 循环
+- `time_limit`（2h）在每步 `query()` 前检查：防「多步拖垮总时长」，但单条命令卡死需依赖 `environment.timeout`（60s）与 Docker `container_timeout`（2h）兜底
+- 上述 8.5 / 8.6 的 v6 对比数据是 `time_limit` 加入**之前**跑的，历史数据不受影响
 
 ---
 
@@ -560,4 +578,8 @@ Auto-CFQ 示例：*What is the structure and key components of the AltAz frame i
                            │
                            ▼
               user message + cfq_stats + pruned_stats
+
+（每个 step 的 query() 之前另有三道全局终止检查，按优先级依次）
+  step_limit (250 步) / cost_limit ($3) / time_limit (7200s ≈ 2h)
+     └─ 超限 → TerminatingException → exit_status 记为失败
 ```
