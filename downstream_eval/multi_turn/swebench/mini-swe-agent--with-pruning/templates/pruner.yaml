@@ -256,6 +256,7 @@ agent:
     Note: A common trigger for this error is you put > 1 bash block(action) in your response.
   step_limit: 250
   cost_limit: 3.
+  time_limit: 7200
   max_repeat_steps: 10
   pruner:
     url: http://localhost:8000/prune
